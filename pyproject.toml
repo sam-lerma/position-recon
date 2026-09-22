@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "position-recon"
+version = "0.1.0"
+description = "Daily position reconciliation between an internal book of record and a prime broker, with a Dash break dashboard"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "dash>=3.0,<5",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "plotly>=5.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+recon-generate = "recon.generate:main"
+recon-run = "recon.pipeline:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM", "C4", "RET"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
