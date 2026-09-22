@@ -120,10 +120,15 @@ class TestFilters:
         assert len(views.apply_filters(day, selected_types=[PRICE_BREAK])) == 1
 
     def test_filters_combine(self, day):
+        # EQ-LC-01 has two breaks and one price break exists, in another
+        # account. Both filters have to bite for this to come back empty, so
+        # the test fails if either is dropped.
         result = views.apply_filters(
-            day, selected_accounts=["EQ-LC-01"], selected_types=[QUANTITY_BREAK]
+            day, selected_accounts=["EQ-LC-01"], selected_types=[PRICE_BREAK]
         )
-        assert len(result) == 2
+        assert len(result) == 0
+        assert len(views.apply_filters(day, selected_accounts=["EQ-LC-01"])) == 2
+        assert len(views.apply_filters(day, selected_types=[PRICE_BREAK])) == 1
 
     def test_no_filter_returns_everything(self, day):
         assert len(views.apply_filters(day, [], [])) == 4

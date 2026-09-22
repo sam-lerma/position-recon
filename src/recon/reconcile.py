@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from recon.config import (
+    CURRENCY_BREAK,
     DEFAULT_TOLERANCES,
     MARKET_VALUE_BREAK,
     MATCHED,
@@ -53,30 +54,41 @@ def reconcile(
     want the exception queue; keeping the matched rows here makes the match rate
     computable from the same frame.
     """
+    # validate rejects a duplicated position on either side rather than fanning
+    # it out into breaks that net to nothing. indicator is what tells us which
+    # side a row came from: deriving that from a null quantity would also flag a
+    # row we did receive but failed to parse.
     merged = internal.merge(
         pb,
         on=POSITION_GRAIN,
         how="outer",
         suffixes=("_internal", "_pb"),
-        indicator=False,
+        indicator="_source",
+        validate="one_to_one",
     )
 
-    # Capture which side is actually present before filling, because after the
-    # fill a missing position is indistinguishable from a flat one.
-    internal_present = merged["quantity_internal"].notna().to_numpy()
-    pb_present = merged["quantity_pb"].notna().to_numpy()
+    source = merged["_source"].astype(str)
+    internal_present = source.isin(["left_only", "both"]).to_numpy()
+    pb_present = source.isin(["right_only", "both"]).to_numpy()
 
     for column in COMPARED:
         for side in ("internal", "pb"):
             merged[f"{column}_{side}"] = merged[f"{column}_{side}"].astype(float).fillna(0.0)
 
-    merged["currency"] = merged["currency_internal"].fillna(merged["currency_pb"])
+    currency_internal = merged["currency_internal"]
+    currency_pb = merged["currency_pb"]
+    merged["currency"] = currency_internal.fillna(currency_pb)
+    currency_disagrees = (
+        internal_present & pb_present & (currency_internal != currency_pb)
+    ).to_numpy()
 
     for column in COMPARED:
         merged[f"{column}_diff"] = merged[f"{column}_internal"] - merged[f"{column}_pb"]
     merged["abs_market_value_diff"] = merged["market_value_diff"].abs()
 
-    merged["break_type"] = _classify(merged, internal_present, pb_present, tolerances)
+    merged["break_type"] = _classify(
+        merged, internal_present, pb_present, currency_disagrees, tolerances
+    )
 
     return (
         merged[OUTPUT_COLUMNS]
@@ -89,6 +101,7 @@ def _classify(
     merged: pd.DataFrame,
     internal_present: np.ndarray,
     pb_present: np.ndarray,
+    currency_disagrees: np.ndarray,
     tolerances: Tolerances,
 ) -> np.ndarray:
     """Label each row with the first rule it trips.
@@ -116,16 +129,37 @@ def _classify(
         atol=tolerances.market_value_abs,
     )
 
+    # A book of record carries zero rows for positions that have been closed,
+    # and a broker correctly drops them. One side flat and the other absent is
+    # agreement, so it is matched ahead of the missing-side rules rather than
+    # sitting in the queue forever at nil value.
+    flat = np.isclose(
+        merged["quantity_internal"].to_numpy() + merged["quantity_pb"].to_numpy(),
+        0.0,
+        rtol=0.0,
+        atol=tolerances.quantity_abs,
+    ) & np.isclose(
+        merged["market_value_internal"].to_numpy() + merged["market_value_pb"].to_numpy(),
+        0.0,
+        rtol=0.0,
+        atol=tolerances.market_value_abs,
+    )
+    one_side_only = internal_present ^ pb_present
+
     conditions = [
+        one_side_only & flat,
         internal_present & ~pb_present,
         ~internal_present & pb_present,
+        currency_disagrees,
         ~quantity_matches,
         ~price_matches,
         ~market_value_matches,
     ]
     choices = [
+        MATCHED,
         MISSING_IN_PB,
         MISSING_IN_INTERNAL,
+        CURRENCY_BREAK,
         QUANTITY_BREAK,
         PRICE_BREAK,
         MARKET_VALUE_BREAK,

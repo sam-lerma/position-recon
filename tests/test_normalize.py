@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from recon.normalize import (
+    DuplicatePositionError,
     InconsistentLotPriceError,
     MissingColumnsError,
     NormalizationError,
@@ -59,6 +60,14 @@ class TestInternal:
     def test_rejects_an_account_that_is_not_in_the_map(self, account_map):
         with pytest.raises(UnmappedAccountError, match="EQ-LC-99"):
             normalize_internal(internal_raw(account_code="EQ-LC-99"), account_map)
+
+    def test_rejects_the_same_position_twice(self, account_map):
+        # A re-delivered file, or a book split by strategy without the strategy
+        # in the key. Left alone it fans out across the join into paired breaks
+        # that net to nothing.
+        doubled = pd.concat([internal_raw(), internal_raw()], ignore_index=True)
+        with pytest.raises(DuplicatePositionError, match="ABC123XYZ"):
+            normalize_internal(doubled, account_map)
 
     def test_rejects_a_feed_that_is_missing_a_column(self, account_map):
         raw = internal_raw().drop(columns=["market_value"])

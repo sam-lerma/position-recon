@@ -7,6 +7,7 @@ them in both. Charts are drawn for the light surface only.
 from __future__ import annotations
 
 from recon.config import (
+    CURRENCY_BREAK,
     MARKET_VALUE_BREAK,
     MISSING_IN_INTERNAL,
     MISSING_IN_PB,
@@ -34,6 +35,7 @@ FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
 BREAK_LABELS = {
     MISSING_IN_PB: "Missing at broker",
     MISSING_IN_INTERNAL: "Missing internally",
+    CURRENCY_BREAK: "Currency",
     QUANTITY_BREAK: "Quantity",
     PRICE_BREAK: "Price",
     MARKET_VALUE_BREAK: "Market value",

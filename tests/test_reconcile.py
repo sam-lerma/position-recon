@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import pytest
+from pandas.errors import MergeError
 
 from recon.config import (
+    CURRENCY_BREAK,
     MARKET_VALUE_BREAK,
     MATCHED,
     MISSING_IN_INTERNAL,
@@ -66,6 +68,44 @@ class TestBreakTypes:
     def test_a_position_only_the_broker_has_is_missing_internally(self):
         result = reconcile(frame(), frame(position("AAA", 1000, 25.0)))
         assert result.loc[0, "break_type"] == MISSING_IN_INTERNAL
+
+
+class TestCurrency:
+    def test_a_currency_disagreement_is_its_own_break(self):
+        internal = position("AAA", 1000, 25.0, currency="GBP")
+        pb = position("AAA", 1000, 25.0, currency="USD")
+        assert classify(internal, pb) == CURRENCY_BREAK
+
+    def test_currency_is_checked_before_the_numbers(self):
+        # Identical numbers under two different currency codes used to match,
+        # and the dashboard then displayed one of them as though it were right.
+        internal = position("AAA", 1000, 25.0, currency="GBP")
+        pb = position("AAA", 900, 30.0, currency="USD")
+        assert classify(internal, pb) == CURRENCY_BREAK
+
+
+class TestClosedPositions:
+    """A book of record carries zero rows; a broker drops them."""
+
+    def test_a_flat_position_the_broker_has_dropped_is_a_match(self):
+        internal = position("AAA", 0, 25.0, market_value=0.0)
+        result = reconcile(frame(internal), frame())
+        assert result.loc[0, "break_type"] == MATCHED
+
+    def test_a_flat_broker_position_we_have_dropped_is_a_match(self):
+        result = reconcile(frame(), frame(position("AAA", 0, 25.0, market_value=0.0)))
+        assert result.loc[0, "break_type"] == MATCHED
+
+    def test_a_real_position_the_broker_has_dropped_is_still_a_break(self):
+        result = reconcile(frame(position("AAA", 1000, 25.0)), frame())
+        assert result.loc[0, "break_type"] == MISSING_IN_PB
+
+
+class TestGrain:
+    def test_a_duplicated_position_is_rejected_rather_than_fanned_out(self):
+        internal = frame(position("AAA", 500, 10.0), position("AAA", 500, 10.0))
+        with pytest.raises(MergeError):
+            reconcile(internal, frame(position("AAA", 1000, 10.0)))
 
 
 class TestClassificationOrder:

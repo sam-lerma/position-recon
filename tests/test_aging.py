@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from recon.aging import add_break_age
+from recon.aging import UnknownReconciliationDateError, add_break_age
 from recon.config import QUANTITY_BREAK
 
 
@@ -27,6 +27,12 @@ def history(*rows: tuple[str, str, str]) -> pd.DataFrame:
 
 def ages(result: pd.DataFrame) -> list[int]:
     return result.sort_values("as_of_date")["age_business_days"].tolist()
+
+
+def aged(*rows: tuple[str, str, str], reconciled: list[str] | None = None) -> pd.DataFrame:
+    """Age a history, optionally over a wider set of dates than it contains."""
+    dates = [pd.Timestamp(date) for date in reconciled] if reconciled else None
+    return add_break_age(history(*rows), reconciled_dates=dates)
 
 
 class TestAge:
@@ -52,15 +58,54 @@ class TestAge:
         assert ages(result) == [0, 1]
 
     def test_closing_and_reopening_restarts_the_clock(self):
-        # Present Monday and Tuesday, absent Wednesday, back on Thursday.
-        result = add_break_age(
-            history(
-                ("2026-09-14", "A", "X"),
-                ("2026-09-15", "A", "X"),
-                ("2026-09-17", "A", "X"),
-            )
+        # Present Monday and Tuesday, matched Wednesday, back on Thursday. The
+        # Wednesday was reconciled, so its absence is a genuine close.
+        result = aged(
+            ("2026-09-14", "A", "X"),
+            ("2026-09-15", "A", "X"),
+            ("2026-09-17", "A", "X"),
+            reconciled=["2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17"],
         )
         assert ages(result) == [0, 1, 0]
+        assert result["first_seen_date"].nunique() == 2
+
+    def test_a_market_holiday_does_not_reset_the_clock(self):
+        # Thursday 26 November 2026 is Thanksgiving. Counting Monday to Friday
+        # would see a two day gap here and reopen every break in the queue.
+        dates = ["2026-11-23", "2026-11-24", "2026-11-25", "2026-11-27", "2026-11-30"]
+        result = aged(*[(date, "A", "X") for date in dates], reconciled=dates)
+        assert ages(result) == [0, 1, 2, 3, 4]
+        assert result["first_seen_date"].nunique() == 1
+        assert result["is_new"].sum() == 1
+
+    def test_good_friday_does_not_reset_the_clock(self):
+        dates = ["2026-04-02", "2026-04-06"]
+        result = aged(*[(date, "A", "X") for date in dates], reconciled=dates)
+        assert ages(result) == [0, 1]
+        assert result["first_seen_date"].nunique() == 1
+
+    def test_a_day_we_never_reconciled_does_not_reset_the_clock(self):
+        # The broker file never arrived on the Wednesday, so we have no
+        # observation. That is not evidence the break closed.
+        result = aged(
+            ("2026-09-14", "A", "X"),
+            ("2026-09-15", "A", "X"),
+            ("2026-09-17", "A", "X"),
+            reconciled=["2026-09-14", "2026-09-15", "2026-09-17"],
+        )
+        assert result["first_seen_date"].nunique() == 1
+        assert result["is_new"].sum() == 1
+        # Age is elapsed trading days, so the unreconciled day still counts.
+        assert ages(result) == [0, 1, 3]
+
+    def test_a_clean_day_does_not_reset_the_clock(self):
+        # Nothing broke on the Tuesday for this key, but other keys did, so the
+        # day was reconciled and contributes no rows for this one.
+        result = aged(
+            ("2026-09-14", "A", "X"),
+            ("2026-09-16", "A", "X"),
+            reconciled=["2026-09-14", "2026-09-15", "2026-09-16"],
+        )
         assert result["first_seen_date"].nunique() == 2
 
     def test_each_break_is_aged_on_its_own(self):
@@ -112,6 +157,12 @@ class TestBuckets:
         result = add_break_age(history(*[(str(d.date()), "A", "X") for d in dates]))
         assert list(result["age_bucket"].cat.categories) == ["0-1d", "2-5d", "6-10d", "11d+"]
         assert result["age_bucket"].cat.ordered
+
+
+class TestReconciledDates:
+    def test_history_outside_the_reconciled_set_is_rejected(self):
+        with pytest.raises(UnknownReconciliationDateError, match="2026-09-15"):
+            aged(("2026-09-15", "A", "X"), reconciled=["2026-09-14"])
 
 
 class TestEdges:

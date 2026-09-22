@@ -35,9 +35,9 @@ COLUMN_WIDTHS = {
     "Security": "auto",
     "Break": "140px",
     "Age": "52px",
-    "Qty internal": "100px",
-    "Qty broker": "100px",
-    "Qty diff": "100px",
+    "Qty internal": "96px",
+    "Qty broker": "96px",
+    "Qty diff": "116px",
     "MV diff USD": "116px",
 }
 
@@ -75,7 +75,7 @@ def build_app(
         columns = [_column(name) for name in queue.columns]
 
         return (
-            _kpi_tiles(views.kpis(day, summary, pd.Timestamp(as_of))),
+            _kpi_tiles(views.kpis(day, summary, pd.Timestamp(as_of), selected_accounts)),
             breaks_by_type_figure(views.breaks_by_type(day)),
             breaks_by_age_figure(views.breaks_by_age(day)),
             break_trend_figure(views.break_trend(filtered)),
@@ -231,9 +231,13 @@ def _money(value: float) -> str:
 def _column(name: str) -> dict:
     """Column spec: numbers right aligned, grouped, no decimals."""
     column = {"name": name, "id": name, "type": "text"}
-    if name in views.QUEUE_NUMERIC:
+    if name in views.QUEUE_DECIMALS:
         column["type"] = "numeric"
-        column["format"] = Format(group=Group.yes, precision=0, scheme=Scheme.fixed)
+        column["format"] = Format(
+            group=Group.yes,
+            precision=views.QUEUE_DECIMALS[name],
+            scheme=Scheme.fixed,
+        )
     return column
 
 

@@ -30,7 +30,19 @@ QUEUE_COLUMNS = {
     "market_value_diff": "MV diff USD",
 }
 
-QUEUE_NUMERIC = ["Age", "Qty internal", "Qty broker", "Qty diff", "MV diff USD"]
+# Decimals per column, shared with the table formatter so the displayed value
+# and the rounded value agree. The quantity difference keeps decimals because a
+# 0.4 share break is well outside tolerance and would otherwise display as 0.
+# The money column does not, because the absolute tolerance floor is a dollar,
+# so a difference under one can never be a break and the cents say nothing.
+QUEUE_DECIMALS = {
+    "Age": 0,
+    "Qty internal": 0,
+    "Qty broker": 0,
+    "Qty diff": 2,
+    "MV diff USD": 0,
+}
+QUEUE_NUMERIC = list(QUEUE_DECIMALS)
 
 
 def load_history(path: Path | str = HISTORY_PATH) -> pd.DataFrame:
@@ -72,17 +84,34 @@ def on_date(history: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
     return history[history["as_of_date"] == pd.Timestamp(as_of)]
 
 
-def kpis(day: pd.DataFrame, summary: pd.DataFrame, as_of: pd.Timestamp) -> dict:
-    """The four numbers an ops lead wants before opening the queue."""
+def kpis(
+    day: pd.DataFrame,
+    summary: pd.DataFrame,
+    as_of: pd.Timestamp,
+    selected_accounts: list[str] | None = None,
+) -> dict:
+    """The four numbers an ops lead wants before opening the queue.
+
+    The account filter has to reach the summary as well as the breaks. The
+    summary is kept per account for exactly this reason: showing a firm-wide
+    match rate beside a one-account break count reads as a reconciled figure
+    and is not one.
+    """
     as_of = pd.Timestamp(as_of)
-    row = summary[summary["as_of_date"] == as_of]
+    rows = summary[summary["as_of_date"] == as_of]
+    if selected_accounts:
+        rows = rows[rows["account_id"].isin(selected_accounts)]
+
+    positions = int(rows["positions"].sum())
+    matched = int(rows["matched"].sum())
+
     return {
         "open_breaks": int(len(day)),
         "new_today": int(day["is_new"].sum()) if len(day) else 0,
         "aged": int((day["age_business_days"] > AGED_THRESHOLD_DAYS).sum()) if len(day) else 0,
         "abs_market_value_diff": float(day["abs_market_value_diff"].sum()) if len(day) else 0.0,
-        "match_rate": float(row["match_rate"].iloc[0]) if len(row) else float("nan"),
-        "positions": int(row["positions"].iloc[0]) if len(row) else 0,
+        "match_rate": (matched / positions) if positions else float("nan"),
+        "positions": positions,
     }
 
 
@@ -149,6 +178,6 @@ def exception_queue(
     queue = ordered[list(QUEUE_COLUMNS)].rename(columns=QUEUE_COLUMNS)
     if labels:
         queue["Break"] = queue["Break"].map(labels).fillna(queue["Break"])
-    for column in QUEUE_NUMERIC:
-        queue[column] = queue[column].round(0)
+    for column, decimals in QUEUE_DECIMALS.items():
+        queue[column] = queue[column].round(decimals)
     return queue.reset_index(drop=True)

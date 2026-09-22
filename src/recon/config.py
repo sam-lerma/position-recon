@@ -40,18 +40,23 @@ class Tolerances:
 DEFAULT_TOLERANCES = Tolerances()
 
 MISSING_IN_PB = "MISSING_IN_PB"
+CURRENCY_BREAK = "CURRENCY_BREAK"
 MISSING_IN_INTERNAL = "MISSING_IN_INTERNAL"
 QUANTITY_BREAK = "QUANTITY_BREAK"
 PRICE_BREAK = "PRICE_BREAK"
 MARKET_VALUE_BREAK = "MARKET_VALUE_BREAK"
 MATCHED = "MATCHED"
 
-# Classification order. The first matching rule wins, so the two missing-side
-# rules must come first: an outer join leaves NaN on the absent side and every
-# numeric comparison below would otherwise fire on it.
+# Classification order. The first matching rule wins, and the order encodes
+# what has to be true before the next comparison means anything:
+#   - the two missing-side rules come first, because an outer join leaves NaN on
+#     the absent side and every numeric comparison below would fire on it;
+#   - a currency disagreement comes next, because nothing below is comparable
+#     across two different currencies.
 BREAK_TYPES = [
     MISSING_IN_PB,
     MISSING_IN_INTERNAL,
+    CURRENCY_BREAK,
     QUANTITY_BREAK,
     PRICE_BREAK,
     MARKET_VALUE_BREAK,

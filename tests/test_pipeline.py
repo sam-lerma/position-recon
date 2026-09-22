@@ -81,18 +81,44 @@ class TestHistory:
     def test_counts_reconcile_with_the_daily_summary(self, outputs):
         history, summary = outputs
         per_day = history.groupby("as_of_date").size()
-        expected = summary.set_index("as_of_date")["breaks"]
+        expected = summary.groupby("as_of_date")["breaks"].sum()
         pd.testing.assert_series_equal(per_day, expected, check_names=False, check_dtype=False)
+
+    def test_counts_reconcile_per_account_too(self, outputs):
+        history, summary = outputs
+        per_account = history.groupby(["as_of_date", "account_id"]).size()
+        expected = summary.set_index(["as_of_date", "account_id"])["breaks"]
+        expected = expected[expected > 0]
+        pd.testing.assert_series_equal(
+            per_account.sort_index(),
+            expected.sort_index(),
+            check_names=False,
+            check_dtype=False,
+        )
 
 
 class TestSummary:
-    def test_one_row_per_business_day(self, outputs):
+    def test_one_row_per_account_per_day(self, outputs):
         _, summary = outputs
-        assert len(summary) == DAYS
+        assert summary["as_of_date"].nunique() == DAYS
+        assert not summary.duplicated(subset=["as_of_date", "account_id"]).any()
 
-    def test_match_rate_is_high_but_not_perfect(self, outputs):
+    def test_every_account_appears_every_day(self, outputs):
         _, summary = outputs
-        assert summary["match_rate"].between(0.80, 0.999).all()
+        per_day = summary.groupby("as_of_date")["account_id"].nunique()
+        assert per_day.nunique() == 1
+
+    def test_the_firm_wide_match_rate_is_high_but_not_perfect(self, outputs):
+        _, summary = outputs
+        daily = summary.groupby("as_of_date")[["matched", "positions"]].sum()
+        rate = daily["matched"] / daily["positions"]
+        assert rate.between(0.80, 0.999).all()
+
+    def test_an_individual_account_may_be_clean_for_a_day(self, outputs):
+        # A per-account rate of 1.0 is a real outcome and must not be treated
+        # as a bug, which is why the range above is asserted firm wide.
+        _, summary = outputs
+        assert (summary["match_rate"] == 1.0).any()
 
     def test_matched_and_breaks_account_for_every_position(self, outputs):
         _, summary = outputs
@@ -171,3 +197,40 @@ class TestKnownDifference:
         assert breaks.iloc[0]["break_type"] == QUANTITY_BREAK
         assert breaks.iloc[0]["quantity_diff"] == 100.0
         assert breaks.iloc[0]["market_value_diff"] == 2_500.0
+
+    def test_an_all_numeric_cusip_keeps_its_leading_zero(self, tmp_path):
+        """037833100 read as a number becomes 37833100 and matches nothing.
+
+        Inference is per file, so one side can keep the zero while the other
+        loses it, turning one clean position into two breaks.
+        """
+        data_dir = tmp_path / "data"
+        internal_dir = data_dir / "raw" / "internal"
+        pb_dir = data_dir / "raw" / "prime_broker"
+        internal_dir.mkdir(parents=True)
+        pb_dir.mkdir(parents=True)
+
+        account_map_path = tmp_path / "account_map.csv"
+        pd.DataFrame({"account_id": ["EQ-LC-01"], "pb_account_code": ["EQLC01"]}).to_csv(
+            account_map_path, index=False
+        )
+
+        # Every CUSIP numeric on our side, one with a letter on theirs, which is
+        # what makes the two files infer different types.
+        (internal_dir / "internal_positions_20260918.csv").write_text(
+            "as_of_date,account_code,cusip,quantity,price,market_value,currency\n"
+            "2026-09-18,EQ-LC-01,037833100,1000.00,250.0000,250000.00,USD\n"
+            "2026-09-18,EQ-LC-01,912828YO7,2000.00,99.5000,1990.00,USD\n"
+        )
+        (pb_dir / "pb_positions_20260918.csv").write_text(
+            "business_date,account,cusip,long_short,quantity,price,market_value,ccy\n"
+            '09/18/2026,EQLC01,037833100,L,"1,000.00",250.0000,"250,000.00",USD\n'
+            '09/18/2026,EQLC01,912828YO7,L,"2,000.00",99.5000,"1,990.00",USD\n'
+        )
+
+        recon = reconcile_date(
+            data_dir, pd.Timestamp("2026-09-18"), load_account_map(account_map_path)
+        )
+
+        assert set(recon["cusip"]) == {"037833100", "912828YO7"}
+        assert set(recon["break_type"]) == {MATCHED}

@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from recon.calendar import business_days
 from recon.config import DEFAULT_DATA_DIR, REFERENCE_DIR
 
 DEFAULT_SEED = 20260921
@@ -63,6 +64,7 @@ BREAK_KINDS = {
     "stale_price": 0.20,
     "dirty_price": 0.10,
     "fx_rate": 0.10,
+    "currency_mismatch": 0.06,
 }
 
 
@@ -105,6 +107,13 @@ def generate(
     for directory in (internal_dir, pb_dir, reference_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
+    # Clear previous feeds. Without this, a run with different dates leaves the
+    # old files behind and the pipeline reconciles a mix of the two, including
+    # days the current calendar says the market was shut.
+    for directory in (internal_dir, pb_dir):
+        for stale in directory.glob("*.csv"):
+            stale.unlink()
+
     rng = np.random.default_rng(seed)
     dates = _business_days(end_date, days)
 
@@ -132,9 +141,10 @@ def generate(
 
 
 def _business_days(end_date: pd.Timestamp | None, days: int) -> list[pd.Timestamp]:
+    """Trading days, so no feed is written for a day the market was shut."""
     if end_date is None:
-        end_date = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=1)[0]
-    return list(pd.bdate_range(end=pd.Timestamp(end_date), periods=days))
+        end_date = pd.Timestamp.today().normalize()
+    return business_days(pd.Timestamp(end_date), days)
 
 
 def _build_accounts() -> pd.DataFrame:
@@ -318,6 +328,10 @@ def _pick_key(
 
     if kind == "dirty_price":
         candidates = [key for key in held if securities[key[1]].instrument_type == "BOND"]
+    elif kind == "corporate_action":
+        # Bonds do not split. Restricting this was a correctness fix, not a
+        # cosmetic one: it was putting 3 for 1 splits on 2036 corporates.
+        candidates = [key for key in held if securities[key[1]].instrument_type == "EQUITY"]
     elif kind == "fx_rate":
         candidates = [key for key in held if securities[key[1]].currency != "USD"]
     else:
@@ -346,6 +360,9 @@ def _episode_params(
         return {"quantity": int(rng.integers(1, 250)) * 100}
     if kind == "dirty_price":
         return {"accrued": float(np.round(rng.uniform(0.35, 2.40), 4))}
+    if kind == "currency_mismatch":
+        wrong = [code for code in CURRENCIES if code != security.currency]
+        return {"reported_currency": str(rng.choice(wrong))}
     if kind == "fx_rate":
         return {"fx_error": float(rng.choice([-1, 1])) * float(rng.uniform(0.002, 0.006))}
     return {}
@@ -372,6 +389,10 @@ def _internal_rows(
                 "price": price,
                 "market_value": _market_value(quantity, price, rate, security.instrument_type),
                 "currency": security.currency,
+                # The rate this row was valued at. An fx_rate episode overrides
+                # it, and lot splitting reuses it rather than re-deriving the
+                # correct rate and quietly undoing the break.
+                "fx_rate": rate,
             }
         )
     return rows
@@ -412,6 +433,7 @@ def _pb_rows(
                 "price": price,
                 "market_value": _market_value(quantity, price, rate, security.instrument_type),
                 "currency": security.currency,
+                "fx_rate": rate,
             }
             continue
 
@@ -422,26 +444,37 @@ def _pb_rows(
         if episode.kind == "late_booking":
             row["quantity"] = row["quantity"] - episode.params["trade_quantity"]
         elif episode.kind == "corporate_action":
-            row["quantity"] = float(np.round(row["quantity"] / episode.params["split_factor"]))
+            # The broker has not applied the split, so it still holds the
+            # pre-split quantity at the pre-split price. Quantity is out by the
+            # factor, price by its inverse, and the two market values agree.
+            # Moving quantity alone would invent a difference worth half the
+            # position.
+            factor = episode.params["split_factor"]
+            row["quantity"] = float(np.round(row["quantity"] / factor))
+            row["price"] = float(np.round(row["price"] * factor, 4))
         elif episode.kind == "stale_price":
             row["price"] = prices[(dates[max(0, index - 1)], episode.cusip)]
         elif episode.kind == "dirty_price":
             row["price"] = float(np.round(row["price"] + episode.params["accrued"], 4))
+        elif episode.kind == "currency_mismatch":
+            # The broker's security master has the wrong trading currency, so
+            # the numbers agree and the label on them does not.
+            row["currency"] = episode.params["reported_currency"]
         elif episode.kind == "fx_rate":
             rate = float(np.round(rate * (1.0 + episode.params["fx_error"]), 6))
 
+        row["fx_rate"] = rate
         row["market_value"] = _market_value(
             row["quantity"], row["price"], rate, security.instrument_type
         )
 
-    return _split_into_lots(rng, list(rows.values()), securities, fx)
+    return _split_into_lots(rng, list(rows.values()), securities)
 
 
 def _split_into_lots(
     rng: np.random.Generator,
     rows: list[dict],
     securities: dict[str, Security],
-    fx: dict[tuple[pd.Timestamp, str], float],
 ) -> list[dict]:
     """Report some positions as several tax lots, as a broker file would.
 
@@ -457,7 +490,7 @@ def _split_into_lots(
             continue
 
         security = securities[row["cusip"]]
-        rate = fx[(row["as_of_date"], security.currency)]
+        rate = row["fx_rate"]
         count = int(rng.choice([2, 3]))
         cuts = sorted(rng.choice(np.arange(1, abs(quantity)), size=count - 1, replace=False))
         edges = [0, *cuts, abs(quantity)]

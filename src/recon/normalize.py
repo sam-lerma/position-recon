@@ -76,6 +76,10 @@ class InconsistentLotPriceError(NormalizationError):
     pass
 
 
+class DuplicatePositionError(NormalizationError):
+    pass
+
+
 def load_account_map(path: Path | str = ACCOUNT_MAP_PATH) -> pd.DataFrame:
     """Reference table mapping the prime broker's account codes to ours."""
     account_map = pd.read_csv(path, dtype=str)
@@ -105,6 +109,11 @@ def normalize_internal(raw: pd.DataFrame, account_map: pd.DataFrame) -> pd.DataF
 
     known = set(account_map["account_id"])
     _reject_unknown_accounts(df["account_id"], known, side="internal")
+
+    # The docstring above claims one row is one position. Check it, because a
+    # re-delivered file or a book split by strategy fans out across the join
+    # into breaks that net to nothing.
+    _reject_duplicate_positions(df)
 
     return df[CANONICAL_COLUMNS].reset_index(drop=True)
 
@@ -164,6 +173,18 @@ def _aggregate_lots(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     return agg[CANONICAL_COLUMNS].reset_index(drop=True)
+
+
+def _reject_duplicate_positions(df: pd.DataFrame) -> None:
+    grain = ["as_of_date", "account_id", "cusip"]
+    duplicated = df.duplicated(subset=grain, keep=False)
+    if duplicated.any():
+        offenders = (
+            df.loc[duplicated, ["account_id", "cusip"]].drop_duplicates().head(5).to_dict("records")
+        )
+        raise DuplicatePositionError(
+            f"internal feed has more than one row for the same position: {offenders}"
+        )
 
 
 def _to_float(series: pd.Series) -> pd.Series:

@@ -19,6 +19,7 @@ from pathlib import Path
 import pandas as pd
 
 from recon.aging import add_break_age
+from recon.calendar import trading_days_between
 from recon.config import (
     ACCOUNT_MAP_PATH,
     DEFAULT_DATA_DIR,
@@ -34,8 +35,23 @@ logger = logging.getLogger(__name__)
 
 DATE_IN_FILENAME = re.compile(r"(\d{8})\.csv$")
 
+# CUSIPs are frequently all numeric, and most of the Treasury range is. Without
+# this, 037833100 is inferred as an integer and reaches the dashboard as
+# 37833100, matching nothing in any security master. Worse, inference is per
+# file, so one side can keep the zero while the other loses it and a clean
+# position becomes two breaks.
+IDENTIFIER_DTYPES = {
+    "cusip": str,
+    "account_code": str,
+    "account": str,
+}
+
+# Summarized per account, not per day. A dashboard filtered to one account
+# needs that account's match rate, and a firm-wide figure beside a filtered
+# break count is worse than no figure at all.
 SUMMARY_COLUMNS = [
     "as_of_date",
+    "account_id",
     "positions",
     "matched",
     "breaks",
@@ -74,8 +90,8 @@ def reconcile_date(
     internal_path = data_dir / "raw" / "internal" / f"internal_positions_{date:%Y%m%d}.csv"
     pb_path = data_dir / "raw" / "prime_broker" / f"pb_positions_{date:%Y%m%d}.csv"
 
-    internal = normalize_internal(pd.read_csv(internal_path), account_map)
-    pb = normalize_pb(pd.read_csv(pb_path), account_map)
+    internal = normalize_internal(pd.read_csv(internal_path, dtype=IDENTIFIER_DTYPES), account_map)
+    pb = normalize_pb(pd.read_csv(pb_path, dtype=IDENTIFIER_DTYPES), account_map)
     return reconcile(internal, pb, tolerances)
 
 
@@ -97,6 +113,8 @@ def run(
     if not dates:
         raise FileNotFoundError(f"no paired feed files found under {data_dir / 'raw'}")
 
+    _warn_about_missing_days(dates)
+
     daily_breaks: list[pd.DataFrame] = []
     summary_rows: list[dict] = []
 
@@ -104,19 +122,13 @@ def run(
         recon = reconcile_date(data_dir, date, account_map, tolerances)
         breaks = breaks_only(recon)
         daily_breaks.append(breaks)
-        summary_rows.append(
-            {
-                "as_of_date": date,
-                "positions": int(len(recon)),
-                "matched": int((recon["break_type"] == MATCHED).sum()),
-                "breaks": int(len(breaks)),
-                "match_rate": float((recon["break_type"] == MATCHED).mean()),
-                "abs_market_value_diff": float(breaks["abs_market_value_diff"].sum()),
-            }
-        )
+        summary_rows.extend(_summarize(recon, breaks, date))
         logger.info("%s: %s breaks of %s positions", date.date(), len(breaks), len(recon))
 
-    history = add_break_age(pd.concat(daily_breaks, ignore_index=True))
+    # Aging needs every date we ran, not just the dates that produced breaks: a
+    # day on which everything matched contributes no rows, and treating that as
+    # a gap would close and reopen every break that spans it.
+    history = add_break_age(pd.concat(daily_breaks, ignore_index=True), reconciled_dates=dates)
     history = _add_security_description(history, security_master_path)
     summary = pd.DataFrame(summary_rows, columns=SUMMARY_COLUMNS)
 
@@ -129,6 +141,43 @@ def run(
     return history, summary
 
 
+def _summarize(recon: pd.DataFrame, breaks: pd.DataFrame, date: pd.Timestamp) -> list[dict]:
+    matched = recon["break_type"] == MATCHED
+    per_account = recon.assign(_matched=matched).groupby("account_id", observed=True)
+    money = breaks.groupby("account_id", observed=True)["abs_market_value_diff"].sum()
+
+    rows = []
+    for account_id, group in per_account:
+        rows.append(
+            {
+                "as_of_date": date,
+                "account_id": account_id,
+                "positions": int(len(group)),
+                "matched": int(group["_matched"].sum()),
+                "breaks": int((~group["_matched"]).sum()),
+                "match_rate": float(group["_matched"].mean()),
+                "abs_market_value_diff": float(money.get(account_id, 0.0)),
+            }
+        )
+    return rows
+
+
+def _warn_about_missing_days(dates: list[pd.Timestamp]) -> None:
+    """Say so when a trading day in the range has no paired feed.
+
+    discover_dates only returns days where both files arrived. Dropping the rest
+    silently would leave a hole in the history that nothing downstream reports.
+    """
+    expected = trading_days_between(dates[0], dates[-1])
+    missing = sorted(set(expected) - set(dates))
+    if missing:
+        logger.warning(
+            "no paired feed for %s trading day(s) in range: %s",
+            len(missing),
+            ", ".join(f"{date:%Y-%m-%d}" for date in missing),
+        )
+
+
 def _add_security_description(
     history: pd.DataFrame,
     security_master_path: Path | str,
@@ -138,8 +187,8 @@ def _add_security_description(
     if not path.exists():
         return history.assign(description=history["cusip"], instrument_type="UNKNOWN")
 
-    master = pd.read_csv(path)[["cusip", "description", "instrument_type"]]
-    merged = history.merge(master, on="cusip", how="left")
+    master = pd.read_csv(path, dtype={"cusip": str})[["cusip", "description", "instrument_type"]]
+    merged = history.merge(master, on="cusip", how="left", validate="many_to_one")
     merged["description"] = merged["description"].fillna(merged["cusip"])
     merged["instrument_type"] = merged["instrument_type"].fillna("UNKNOWN")
     return merged
@@ -161,12 +210,17 @@ def main(argv: list[str] | None = None) -> int:
         data_dir=args.data_dir,
         as_of=pd.Timestamp(args.as_of) if args.as_of else None,
     )
-    latest = summary.iloc[-1]
+    latest_date = summary["as_of_date"].max()
+    latest = summary[summary["as_of_date"] == latest_date]
+    positions = int(latest["positions"].sum())
+    matched = int(latest["matched"].sum())
     print(
-        f"{len(summary)} days reconciled through {latest['as_of_date']:%Y-%m-%d}. "
-        f"{latest['breaks']} open breaks, "
-        f"match rate {latest['match_rate']:.2%}, "
-        f"absolute difference ${latest['abs_market_value_diff']:,.0f}."
+        f"{summary['as_of_date'].nunique()} days reconciled through "
+        f"{latest_date:%Y-%m-%d}. "
+        f"{int(latest['breaks'].sum())} open breaks across "
+        f"{len(latest)} accounts, "
+        f"match rate {matched / positions:.2%}, "
+        f"absolute difference ${latest['abs_market_value_diff'].sum():,.0f}."
     )
     print(f"wrote {Path(args.data_dir) / 'output' / 'breaks_history.csv'}")
     return 0
